@@ -1,0 +1,8 @@
+yfinance
+pandas
+numpy
+matplotlib
+customtkinter
+# Für die Verpackung (optional, je nach gewähltem Tool)
+# cx_Freeze
+# pyinstaller
