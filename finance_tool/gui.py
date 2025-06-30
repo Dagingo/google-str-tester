@@ -376,9 +376,9 @@ class FinanceApp(ctk.CTk):
 
             fig = Figure(figsize=(8, 4), dpi=100) # Angepasste Größe
             # Die plot_results Methode des Backtesters benötigt plt.show(), was hier nicht ideal ist.
-            # Wir müssen die Plot-Logik anpassen oder hier neu implementieren.
-            # Fürs Erste: Direkte Plot-Logik hier (vereinfacht)
+            # Stattdessen erstellen wir die Figure hier und geben sie an _update_backtest_results_ui.
 
+            fig = Figure(figsize=(8, 4), dpi=100)
             ax1 = fig.add_subplot(111)
             ax1.plot(backtester.portfolio_history.index, backtester.portfolio_history['total_value'], label='Portfolio Value', color='blue', lw=1.5)
             ax1.set_xlabel('Datum', fontsize=10)
@@ -393,7 +393,6 @@ class FinanceApp(ctk.CTk):
             ax2.set_ylabel('Aktienkurs (€)', color='grey', fontsize=10)
             ax2.tick_params(axis='y', labelcolor='grey', labelsize=8)
 
-            # Handelssignale plotten
             if backtester.results is not None and not backtester.results.empty:
                 buys = backtester.results[backtester.results['type'] == 'Buy']
                 sells = backtester.results[backtester.results['type'] == 'Sell']
@@ -405,20 +404,62 @@ class FinanceApp(ctk.CTk):
             lines, labels = ax1.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
             ax1.legend(lines + lines2, labels + labels2, loc='upper left', fontsize=8)
-
             fig.tight_layout()
 
-            canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
-            canvas_widget = canvas.get_tk_widget()
-            canvas_widget.pack(side=ctk.TOP, fill=ctk.BOTH, expand=True)
-            canvas.draw()
+            # UI-Updates verzögert ausführen
+            self.after(10, lambda: self._update_backtest_results_ui(metrics, fig))
 
         except ValueError as e:
             messagebox.showerror("Parameterfehler", f"Fehler in den Parametern oder Daten: {e}")
+            self.after(10, lambda: self._update_backtest_results_ui({"error": str(e)}, None)) # Fehler auch in UI zeigen
         except Exception as e:
             messagebox.showerror("Backtest Fehler", f"Ein unerwarteter Fehler ist aufgetreten: {e}")
             import traceback
-            traceback.print_exc()
+            error_info = traceback.format_exc()
+            print(error_info) # Für Debugging in Konsole
+            self.after(10, lambda: self._update_backtest_results_ui({"error": str(e), "details": error_info.splitlines()[-1]}, None))
+
+
+    def _update_backtest_results_ui(self, metrics, fig):
+        """Aktualisiert die Metrik-Textbox und den Chart nach einem Backtest."""
+        # Metriken anzeigen
+        self.metrics_text.configure(state="normal")
+        self.metrics_text.delete("0.0", "end")
+
+        # Hole Ticker-Symbol sicher, falls Entry nicht existiert (sollte nicht passieren, aber zur Sicherheit)
+        try:
+            ticker_display_name = self.ticker_entry.get() if self.ticker_entry else "N/A"
+        except Exception:
+            ticker_display_name = "N/A"
+
+        metrics_str = f"Backtest für {self.strategy_var.get()} auf {ticker_display_name}:\n"
+        if "error" in metrics: # Spezielle Behandlung für Fehlerfälle
+            metrics_str += f"  Fehler: {metrics['error']}\n"
+            if "details" in metrics:
+                 metrics_str += f"  Details: {metrics['details']}\n"
+        else:
+            for key, value in metrics.items():
+                metrics_str += f"  {key.replace('_', ' ').capitalize()}: {value}\n"
+        self.metrics_text.insert("0.0", metrics_str)
+        self.metrics_text.configure(state="disabled")
+
+        # Chart anzeigen
+        # Alten Chart entfernen, falls vorhanden
+        # Sicherstellen, dass self.chart_frame existiert, bevor darauf zugegriffen wird
+        if hasattr(self, 'chart_frame') and self.chart_frame.winfo_exists():
+            for widget in self.chart_frame.winfo_children():
+                widget.destroy()
+
+            if fig: # Nur wenn eine Figure übergeben wurde
+                canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
+                canvas_widget = canvas.get_tk_widget()
+                canvas_widget.pack(side=ctk.TOP, fill=ctk.BOTH, expand=True)
+                canvas.draw()
+            else:
+                # Fallback, falls keine Figure vorhanden ist (z.B. Fehler im Plotting oder Fehlerfall oben)
+                ctk.CTkLabel(self.chart_frame, text="Chart konnte nicht geladen werden oder Fehler beim Backtest.").pack(padx=10, pady=10)
+        else:
+            print("Fehler: self.chart_frame existiert nicht oder wurde zerstört, bevor der Chart gezeichnet werden konnte.")
 
 
 if __name__ == '__main__':
