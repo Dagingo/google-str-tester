@@ -1,8 +1,10 @@
 yfinance
 pandas
-numpy
+numpy<2.0
 matplotlib
-customtkinter
+PyQt6
+pandas_ta
+setuptools
 # Für die Verpackung (optional, je nach gewähltem Tool)
 # cx_Freeze
 # pyinstaller

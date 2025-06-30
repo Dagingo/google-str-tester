@@ -1,568 +1,647 @@
 # finance_tool/gui.py
-
-import customtkinter as ctk
-from tkinter import ttk, messagebox # filedialog nicht direkt verwendet, kann raus
-import pandas as pd
+import sys
+import logging
+from PyQt6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QTabWidget, QMenuBar, QStatusBar, QSpacerItem, QSizePolicy,
+    QTableView, QLineEdit, QDateEdit, QComboBox, QFileDialog, QTextEdit,
+    QMessageBox, QGroupBox, QFormLayout, QDialog
+)
+from PyQt6.QtGui import QAction, QStandardItemModel, QStandardItem
+from PyQt6.QtCore import Qt, QDate
 from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-import datetime
-import logging # Logging hinzugefügt
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg # Nutze Qt5Agg, da oft kompatibler, oder QtAgg wenn verfügbar
+import pandas as pd
+import numpy as np # Hinzugefügt für np.floating
+from typing import Optional, List, Dict, Any
 
-# Importiere Module aus dem Paket finance_tool
+
+# Backend-Importe (angenommen, sie sind im PYTHONPATH oder relativ erreichbar)
 try:
     from .data_fetcher import fetch_data, get_stock_info
-    from .strategies import setup_strategy
+    from .indicators import get_available_indicators # Funktion zum Abrufen von Indikator-Infos
+    from .strategy_definition import StrategyDefinition, load_strategy_from_json
+    from .data_pipeline import prepare_data_for_strategy
+    from .strategy_engine import StrategyEvaluator
     from .backtester import Backtester
-except ImportError:
-    print("Versuche Fallback-Importe für GUI (wahrscheinlich direkter Testlauf von gui.py)...")
+except ImportError as e:
+    # Fallback für den Fall, dass die GUI direkt ausgeführt wird und das Paket nicht richtig erkannt wird
+    logger.error(f"Standard-Importe fehlgeschlagen: {e}. Versuche alternative Importe für standalone Ausführung.")
     from data_fetcher import fetch_data, get_stock_info
-    from strategies import setup_strategy
+    from indicators import get_available_indicators
+    from strategy_definition import StrategyDefinition, load_strategy_from_json
+    from data_pipeline import prepare_data_for_strategy
+    from strategy_engine import StrategyEvaluator
     from backtester import Backtester
 
-logger = logging.getLogger(__name__) # Logger für dieses Modul
 
-class FinanceApp(ctk.CTk):
+logger = logging.getLogger(__name__)
+
+class DataFrameModel(QStandardItemModel):
+    """Ein einfaches Modell, um einen Pandas DataFrame in einer QTableView anzuzeigen."""
+    def __init__(self, data: pd.DataFrame, parent=None):
+        super().__init__(parent)
+        if data is None:
+            return
+
+        self.setHorizontalHeaderLabels(data.columns.tolist())
+
+        for row_idx, row_data in data.iterrows():
+            items = []
+            # Index als erste Spalte hinzufügen, falls er benannt ist oder ein DatetimeIndex
+            if data.index.name:
+                items.append(QStandardItem(str(data.index.name))) # Header für Index
+            elif isinstance(data.index, pd.DatetimeIndex):
+                 items.append(QStandardItem(str(row_idx.strftime('%Y-%m-%d %H:%M:%S')) if isinstance(row_idx, pd.Timestamp) else str(row_idx)))
+            else:
+                items.append(QStandardItem(str(row_idx)))
+
+            for val in row_data:
+                items.append(QStandardItem(f"{val:.4f}" if isinstance(val, (float, np.floating)) else str(val)))
+            self.appendRow(items)
+
+    def setHorizontalHeaderLabels(self, labels: List[str]):
+        # Wenn der Index als erste Spalte angezeigt wird, muss der Header angepasst werden
+        if self.rowCount() > 0 and self.columnCount() == len(labels) + 1: # Index + Spalten
+            if isinstance(self.parent().current_data_df.index, pd.DatetimeIndex): # Annahme: parent ist MainWindow
+                 actual_header_labels = [self.parent().current_data_df.index.name or "Date"] + labels
+            else:
+                 actual_header_labels = [self.parent().current_data_df.index.name or "Index"] + labels
+            super().setHorizontalHeaderLabels(actual_header_labels)
+        else:
+            super().setHorizontalHeaderLabels(labels)
+
+
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        logger.info("FinanceApp.__init__: Initialisierung gestartet.")
+        logger.info("MainWindow.__init__: Initialisierung gestartet.")
 
-        self.title("Finance Analysis Tool")
-        self.geometry("1200x800")
-        # Appearance Mode wird beim Start gesetzt, kein separates Logging nötig, außer es gibt Probleme
-        ctk.set_appearance_mode("System")
-        ctk.set_default_color_theme("blue")
+        self.setWindowTitle("Finance Analysis Tool (PyQt6)")
+        self.setGeometry(100, 100, 1200, 800) # x, y, width, height
 
-        self.data_frame = None
-        self.backtest_results_fig = None
-        self.current_main_frame = None
-        self._active_params_display_frame = None # Initialisiert für Klarheit
-        self.current_strategy_param_vars = {} # Initialisiert für Klarheit
+        # Zentrale Widget und Layout
+        self.central_widget = QWidget()
+        self.setCentralWidget(self.central_widget)
+        self.main_layout = QHBoxLayout(self.central_widget) # Hauptlayout für Sidebar und Tabs
 
-        # --- Layout ---
-        self.grid_columnconfigure(1, weight=1)
-        self.grid_rowconfigure(0, weight=1)
+        # Datenmodelle und Referenzen
+        self.current_data_df: Optional[pd.DataFrame] = None
+        self.current_strategy_def: Optional[StrategyDefinition] = None
+        self.available_indicators_info: List[Dict[str, Any]] = []
+        self.backtester_instance = Backtester() # Eine Instanz für die App
 
-        # Sidebar
-        self.sidebar_frame = ctk.CTkFrame(self, width=200, corner_radius=0)
-        self.sidebar_frame.grid(row=0, column=0, rowspan=4, sticky="nsew")
-        self.sidebar_frame.grid_rowconfigure(4, weight=1)
-        logger.debug(f"FinanceApp.__init__: Sidebar erstellt (ID: {id(self.sidebar_frame)})")
+        # Matplotlib Canvas für Charts
+        self.mpl_figure: Optional[Figure] = None
+        self.mpl_canvas: Optional[FigureCanvasQTAgg] = None
 
 
-        self.logo_label = ctk.CTkLabel(self.sidebar_frame, text="FinanceTool", font=ctk.CTkFont(size=20, weight="bold"))
-        self.logo_label.grid(row=0, column=0, padx=20, pady=(20, 10))
+        # Sidebar (links)
+        self.sidebar_widget = QWidget()
+        self.sidebar_layout = QVBoxLayout(self.sidebar_widget)
+        self.sidebar_widget.setFixedWidth(200)
+        # self.sidebar_widget.setStyleSheet("background-color: #f0f0f0;")
 
-        self.data_button = ctk.CTkButton(self.sidebar_frame, text="Datenabruf", command=self.show_data_frame)
-        self.data_button.grid(row=1, column=0, padx=20, pady=10, sticky="ew")
+        self.app_title_label = QLabel("FinanceTool")
+        font = self.app_title_label.font()
+        font.setPointSize(16)
+        font.setBold(True)
+        self.app_title_label.setFont(font)
+        self.app_title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sidebar_layout.addWidget(self.app_title_label)
 
-        self.backtest_button = ctk.CTkButton(self.sidebar_frame, text="Backtesting", command=self.show_backtesting_frame)
-        self.backtest_button.grid(row=2, column=0, padx=20, pady=10, sticky="ew")
+        # Buttons für Sidebar
+        self.btn_data_fetch = QPushButton("Datenabruf")
+        self.btn_data_fetch.clicked.connect(self.show_data_fetch_tab)
+        self.sidebar_layout.addWidget(self.btn_data_fetch)
 
-        self.appearance_mode_label = ctk.CTkLabel(self.sidebar_frame, text="Appearance Mode:", anchor="w")
-        self.appearance_mode_label.grid(row=5, column=0, padx=20, pady=(10, 0))
-        self.appearance_mode_optionemenu = ctk.CTkOptionMenu(self.sidebar_frame, values=["Light", "Dark", "System"],
-                                                                       command=self.change_appearance_mode_event)
-        self.appearance_mode_optionemenu.grid(row=6, column=0, padx=20, pady=(0,20), sticky="ew")
+        self.btn_indicators = QPushButton("Indikatoren")
+        self.btn_indicators.clicked.connect(self.show_indicators_tab)
+        self.sidebar_layout.addWidget(self.btn_indicators)
 
-        logger.info("FinanceApp.__init__: Initialisiere mit Datenabruf-Frame.")
-        self.show_data_frame() # Initialansicht
-        logger.info("FinanceApp.__init__: Initialisierung beendet.")
+        self.btn_strategy_mgmt = QPushButton("Strategie Mgmt.")
+        self.btn_strategy_mgmt.clicked.connect(self.show_strategy_mgmt_tab)
+        self.sidebar_layout.addWidget(self.btn_strategy_mgmt)
 
+        self.btn_backtesting = QPushButton("Backtesting")
+        self.btn_backtesting.clicked.connect(self.show_backtesting_tab)
+        self.sidebar_layout.addWidget(self.btn_backtesting)
 
-    def change_appearance_mode_event(self, new_appearance_mode: str):
-        logger.info(f"change_appearance_mode_event: Modus geändert zu '{new_appearance_mode}'.")
-        ctk.set_appearance_mode(new_appearance_mode)
+        self.sidebar_layout.addSpacerItem(QSpacerItem(20, 40, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Expanding))
+        self.main_layout.addWidget(self.sidebar_widget)
 
-    def clear_main_frame(self):
-        logger.debug("clear_main_frame: Aufgerufen.")
-        if self.current_main_frame and self.current_main_frame.winfo_exists():
-            old_frame_id = id(self.current_main_frame)
-            logger.debug(f"clear_main_frame: Zerstöre alten self.current_main_frame (ID: {old_frame_id}, Name: {str(self.current_main_frame)}).")
-            try:
-                # Zerstöre Kinder zuerst, um potenzielle Probleme zu minimieren
-                for widget in self.current_main_frame.winfo_children():
-                    logger.debug(f"clear_main_frame: Zerstöre Kind-Widget (ID: {id(widget)}, Name: {str(widget)}) von altem Mainframe.")
-                    widget.destroy()
-                self.current_main_frame.destroy()
-                logger.debug(f"clear_main_frame: Alter self.current_main_frame (ID: {old_frame_id}) erfolgreich zerstört.")
-            except Exception as e:
-                logger.error(f"clear_main_frame: Fehler beim Zerstören des alten Mainframes (ID: {old_frame_id}): {e}", exc_info=True)
-        elif self.current_main_frame:
-             logger.warning(f"clear_main_frame: Alter self.current_main_frame (ID: {id(self.current_main_frame)}) existiert nicht mehr laut winfo_exists().")
-        else:
-            logger.debug("clear_main_frame: Kein self.current_main_frame zum Zerstören vorhanden.")
+        # Tab-Widget für Hauptinhalt (rechts)
+        self.tab_widget = QTabWidget()
+        self.tab_widget.setTabsClosable(True) # Erlaubt das Schließen von Tabs
+        self.tab_widget.tabCloseRequested.connect(self.close_tab)
+        self.main_layout.addWidget(self.tab_widget)
 
-        self.current_main_frame = ctk.CTkFrame(self, corner_radius=5)
-        self.current_main_frame.grid(row=0, column=1, padx=20, pady=20, sticky="nsew")
-        self.current_main_frame.grid_columnconfigure(0, weight=1)
-        self.current_main_frame.grid_rowconfigure(1, weight=1)
-        logger.debug(f"clear_main_frame: Neuer self.current_main_frame erstellt (ID: {id(self.current_main_frame)}, Name: {str(self.current_main_frame)}).")
+        self._create_menu_bar()
+        self._create_status_bar()
+
+        # Lade verfügbare Indikatoren beim Start
+        self._load_available_indicators()
+
+        logger.info("MainWindow.__init__: Initialisierung beendet.")
+        self.show_data_fetch_tab() # Start-Tab
 
 
-    def show_data_frame(self):
-        logger.info("show_data_frame: Aufgerufen.")
-        self.clear_main_frame()
-
-        logger.debug("show_data_frame: Erstelle UI-Elemente für Datenabruf.")
-        input_controls_frame = ctk.CTkFrame(self.current_main_frame)
-        input_controls_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
-
-        ctk.CTkLabel(input_controls_frame, text="Ticker:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.ticker_entry = ctk.CTkEntry(input_controls_frame, placeholder_text="z.B. AAPL, ^GDAXI")
-        self.ticker_entry.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        self.ticker_entry.insert(0, "AAPL")
-
-        ctk.CTkLabel(input_controls_frame, text="Startdatum:").grid(row=0, column=2, padx=5, pady=5, sticky="w")
-        self.start_date_entry = ctk.CTkEntry(input_controls_frame, placeholder_text="JJJJ-MM-TT")
-        self.start_date_entry.grid(row=0, column=3, padx=5, pady=5, sticky="ew")
-        self.start_date_entry.insert(0, (datetime.date.today() - datetime.timedelta(days=365)).strftime("%Y-%m-%d"))
-
-        ctk.CTkLabel(input_controls_frame, text="Enddatum:").grid(row=0, column=4, padx=5, pady=5, sticky="w")
-        self.end_date_entry = ctk.CTkEntry(input_controls_frame, placeholder_text="JJJJ-MM-TT")
-        self.end_date_entry.grid(row=0, column=5, padx=5, pady=5, sticky="ew")
-        self.end_date_entry.insert(0, datetime.date.today().strftime("%Y-%m-%d"))
-
-        ctk.CTkLabel(input_controls_frame, text="Intervall:").grid(row=0, column=6, padx=5, pady=5, sticky="w")
-        self.interval_options = ["1d", "1wk", "1mo", "1h", "30m", "5m"]
-        self.interval_var = ctk.StringVar(value="1d")
-        self.interval_menu = ctk.CTkOptionMenu(input_controls_frame, variable=self.interval_var, values=self.interval_options)
-        self.interval_menu.grid(row=0, column=7, padx=5, pady=5, sticky="ew")
-
-        self.fetch_button = ctk.CTkButton(input_controls_frame, text="Daten abrufen", command=self.fetch_data_and_display)
-        self.fetch_button.grid(row=0, column=8, padx=10, pady=5)
-
-        input_controls_frame.grid_columnconfigure(1, weight=1)
-        input_controls_frame.grid_columnconfigure(3, weight=1)
-        input_controls_frame.grid_columnconfigure(5, weight=1)
-
-        self.data_display_frame = ctk.CTkFrame(self.current_main_frame)
-        self.data_display_frame.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
-        self.data_display_frame.grid_columnconfigure(0, weight=1)
-        self.data_display_frame.grid_rowconfigure(0, weight=1)
-
-        self.tree = ttk.Treeview(self.data_display_frame, show="headings")
-        self.tree.grid(row=0, column=0, sticky="nsew")
-        vsb = ttk.Scrollbar(self.data_display_frame, orient="vertical", command=self.tree.yview)
-        vsb.grid(row=0, column=1, sticky="ns")
-        self.tree.configure(yscrollcommand=vsb.set)
-        hsb = ttk.Scrollbar(self.data_display_frame, orient="horizontal", command=self.tree.xview)
-        hsb.grid(row=1, column=0, sticky="ew")
-        self.tree.configure(xscrollcommand=hsb.set)
-
-        style = ttk.Style()
+    def _load_available_indicators(self):
+        logger.debug("MainWindow._load_available_indicators: Lade verfügbare Indikatoren.")
         try:
-            current_theme = style.theme_use()
-            logger.debug(f"show_data_frame: Aktuelles ttk Theme: {current_theme}")
-            # Versuche, ein Theme zu verwenden, das besser zu CTk passt, falls nicht schon optimal
-            if 'clam' in style.theme_names():
-                style.theme_use('clam')
-            style.configure("Treeview", rowheight=25, font=('Arial', 10)) # Beispiel Font
-            style.configure("Treeview.Heading", font=('Arial', 11, 'bold'))
+            self.available_indicators_info = get_available_indicators()
+            logger.info(f"{len(self.available_indicators_info)} Indikatoren geladen.")
         except Exception as e:
-            logger.warning(f"show_data_frame: Fehler beim Konfigurieren des ttk Styles: {e}")
-
-        logger.info("show_data_frame: Beendet.")
-
-
-    def fetch_data_and_display(self):
-        logger.info("fetch_data_and_display: Aufgerufen.")
-        ticker = self.ticker_entry.get() if hasattr(self, 'ticker_entry') and self.ticker_entry.winfo_exists() else ""
-        start_date = self.start_date_entry.get() if hasattr(self, 'start_date_entry') and self.start_date_entry.winfo_exists() else ""
-        end_date = self.end_date_entry.get() if hasattr(self, 'end_date_entry') and self.end_date_entry.winfo_exists() else ""
-        interval = self.interval_var.get() # StringVar ist immer sicher
-        logger.debug(f"fetch_data_and_display: Parameter - Ticker: '{ticker}', Start: '{start_date}', Ende: '{end_date}', Intervall: '{interval}'")
-
-        if not ticker or not start_date or not end_date:
-            logger.warning("fetch_data_and_display: Eingabefelder unvollständig.")
-            messagebox.showerror("Eingabefehler", "Bitte alle Felder ausfüllen.")
-            return
-
-        try:
-            datetime.datetime.strptime(start_date, "%Y-%m-%d")
-            datetime.datetime.strptime(end_date, "%Y-%m-%d")
-        except ValueError:
-            logger.warning(f"fetch_data_and_display: Ungültiges Datumsformat. Start: '{start_date}', Ende: '{end_date}'.")
-            messagebox.showerror("Formatfehler", "Datumsformat muss JJJJ-MM-TT sein.")
-            return
-
-        logger.debug(f"fetch_data_and_display: Rufe fetch_data für Ticker '{ticker}'.")
-        self.data_frame = fetch_data(ticker, start_date, end_date, interval)
-
-        if not (hasattr(self, 'tree') and self.tree.winfo_exists()):
-            logger.error("fetch_data_and_display: Treeview-Widget existiert nicht mehr. Breche Anzeige ab.")
-            return
-
-        for i in self.tree.get_children():
-            self.tree.delete(i)
-        self.tree["columns"] = []
-
-        if self.data_frame is not None and not self.data_frame.empty:
-            logger.info(f"fetch_data_and_display: Daten für '{ticker}' erfolgreich abgerufen ({len(self.data_frame)} Zeilen). Fülle Treeview.")
-            cols = list(self.data_frame.columns)
-            cols.insert(0, self.data_frame.index.name if self.data_frame.index.name else "Date")
-            self.tree["columns"] = cols
-            for col in cols:
-                self.tree.heading(col, text=col)
-                self.tree.column(col, width=100, anchor='center')
-            for index, row in self.data_frame.iterrows():
-                row_values = [index.strftime('%Y-%m-%d %H:%M:%S') if isinstance(index, pd.Timestamp) else str(index)]
-                row_values.extend([f"{val:.2f}" if isinstance(val, float) else str(val) for val in row.values])
-                self.tree.insert("", "end", values=row_values)
-
-            stock_info = get_stock_info(ticker)
-            if stock_info and 'longName' in stock_info and hasattr(self, 'logo_label') and self.logo_label.winfo_exists():
-                 self.logo_label.configure(text=stock_info['longName'])
-            elif hasattr(self, 'logo_label') and self.logo_label.winfo_exists():
-                 self.logo_label.configure(text=ticker if ticker else "FinanceTool")
-
-        elif self.data_frame is not None and self.data_frame.empty:
-            logger.info(f"fetch_data_and_display: Keine Daten für '{ticker}' im Zeitraum gefunden.")
-            messagebox.showinfo("Keine Daten", f"Keine Daten für {ticker} im angegebenen Zeitraum gefunden.")
-            if hasattr(self, 'logo_label') and self.logo_label.winfo_exists():
-                self.logo_label.configure(text=ticker if ticker else "FinanceTool")
-        else:
-            logger.error(f"fetch_data_and_display: Fehler beim Abrufen der Daten für '{ticker}'.")
-            messagebox.showerror("Fehler", f"Fehler beim Abrufen der Daten für {ticker}.")
-            if hasattr(self, 'logo_label') and self.logo_label.winfo_exists():
-                self.logo_label.configure(text="FinanceTool")
-        logger.info("fetch_data_and_display: Beendet.")
+            logger.error(f"Fehler beim Laden der verfügbaren Indikatoren: {e}", exc_info=True)
+            QMessageBox.warning(self, "Fehler", f"Konnte Indikatoren nicht laden: {e}")
 
 
-    def show_backtesting_frame(self):
-        logger.info("show_backtesting_frame: Aufgerufen.")
-        self.clear_main_frame()
+    def _create_menu_bar(self):
+        logger.debug("MainWindow._create_menu_bar: Erstelle Menüleiste.")
+        self.menu_bar = self.menuBar() # QMenuBar Instanz von QMainWindow holen
 
-        if self.data_frame is None or self.data_frame.empty:
-            logger.warning("show_backtesting_frame: Keine Daten für Backtesting vorhanden. Zeige Info-Label.")
-            ctk.CTkLabel(self.current_main_frame, text="Bitte zuerst Daten im 'Datenabruf'-Tab laden.",
-                         font=ctk.CTkFont(size=16)).pack(pady=50, padx=20, fill="both", expand=True)
-            return
+        # Datei-Menü
+        file_menu = self.menu_bar.addMenu("&Datei")
+        exit_action = QAction("&Beenden", self)
+        exit_action.triggered.connect(self.close) # Schließt die Anwendung
+        file_menu.addAction(exit_action)
 
-        logger.debug("show_backtesting_frame: Erstelle UI-Elemente für Backtesting.")
-        backtest_controls_frame = ctk.CTkFrame(self.current_main_frame)
-        backtest_controls_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
-        logger.debug(f"show_backtesting_frame: backtest_controls_frame erstellt (ID: {id(backtest_controls_frame)})")
+        # Ansicht-Menü (Beispiel)
+        view_menu = self.menu_bar.addMenu("&Ansicht")
+        # Hier könnten Aktionen zum Ein-/Ausblenden von Docks/Toolbars etc. hinzukommen
 
-
-        ctk.CTkLabel(backtest_controls_frame, text="Strategie:").grid(row=0, column=0, padx=5, pady=5, sticky="w")
-        self.strategy_options = ["MA_Crossover", "RSI"]
-        current_strat_val = self.strategy_var.get() if hasattr(self, 'strategy_var') else "MA_Crossover"
-        self.strategy_var = ctk.StringVar(value=current_strat_val) # Behalte ggf. alte Auswahl
-        self.strategy_menu = ctk.CTkOptionMenu(backtest_controls_frame, variable=self.strategy_var, values=self.strategy_options, command=self.update_strategy_params_ui)
-        self.strategy_menu.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
-        logger.debug(f"show_backtesting_frame: strategy_menu erstellt (ID: {id(self.strategy_menu)}) mit Strategie '{self.strategy_var.get()}'")
-
-        self.strategy_params_container_frame = ctk.CTkFrame(backtest_controls_frame)
-        self.strategy_params_container_frame.grid(row=1, column=0, columnspan=4, padx=5, pady=5, sticky="ew")
-        logger.debug(f"show_backtesting_frame: strategy_params_container_frame erstellt (ID: {id(self.strategy_params_container_frame)}, Exists: {self.strategy_params_container_frame.winfo_exists()})")
-
-        # _active_params_display_frame wird in update_strategy_params_ui verwaltet und initial auf None gesetzt (in __init__)
-
-        self.run_backtest_button = ctk.CTkButton(backtest_controls_frame, text="Backtest starten", command=self.run_backtest_and_display)
-        self.run_backtest_button.grid(row=0, column=2, padx=10, pady=5)
-        logger.debug(f"show_backtesting_frame: run_backtest_button erstellt (ID: {id(self.run_backtest_button)})")
-
-        backtest_controls_frame.grid_columnconfigure(1, weight=1)
-
-        if not hasattr(self, 'current_strategy_param_vars') or not self.current_strategy_param_vars: # Nur wenn leer oder nicht existent
-            self.current_strategy_param_vars = {}
-
-        logger.debug(f"show_backtesting_frame: Rufe update_strategy_params_ui mit Strategie '{self.strategy_var.get()}'.")
-        self.update_strategy_params_ui(self.strategy_var.get())
-        logger.debug("show_backtesting_frame: update_strategy_params_ui zurückgekehrt.")
-
-        self.backtest_display_frame = ctk.CTkFrame(self.current_main_frame)
-        self.backtest_display_frame.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
-        self.backtest_display_frame.grid_columnconfigure(0, weight=1)
-        self.backtest_display_frame.grid_rowconfigure(0, weight=3)
-        self.backtest_display_frame.grid_rowconfigure(1, weight=1)
-        logger.debug(f"show_backtesting_frame: backtest_display_frame erstellt (ID: {id(self.backtest_display_frame)})")
+    def _create_status_bar(self):
+        logger.debug("MainWindow._create_status_bar: Erstelle Statusleiste.")
+        self.status_bar = QStatusBar()
+        self.setStatusBar(self.status_bar)
+        self.status_bar.showMessage("Bereit.", 3000) # Nachricht für 3 Sekunden
 
 
-        self.chart_frame = ctk.CTkFrame(self.backtest_display_frame)
-        self.chart_frame.grid(row=0, column=0, sticky="nsew", padx=5, pady=5)
-        logger.debug(f"show_backtesting_frame: chart_frame erstellt (ID: {id(self.chart_frame)}, Exists: {self.chart_frame.winfo_exists()})")
-
-        self.metrics_text = ctk.CTkTextbox(self.backtest_display_frame, height=150, wrap="word", font=("Arial", 12))
-        self.metrics_text.grid(row=1, column=0, sticky="nsew", padx=5, pady=5)
-        self.metrics_text.insert("0.0", "Performance Metriken werden hier angezeigt...")
-        self.metrics_text.configure(state="disabled")
-        logger.debug(f"show_backtesting_frame: metrics_text erstellt (ID: {id(self.metrics_text)}, Exists: {self.metrics_text.winfo_exists()})")
-        logger.info("show_backtesting_frame: Beendet.")
-
-
-    def update_strategy_params_ui(self, strategy_name):
-        logger.info(f"update_strategy_params_ui: Aufgerufen mit strategy_name='{strategy_name}'.")
-
-        # Container muss existieren
-        if not (hasattr(self, 'strategy_params_container_frame') and self.strategy_params_container_frame.winfo_exists()):
-            logger.error("update_strategy_params_ui: strategy_params_container_frame existiert nicht! UI-Update abgebrochen.")
-            return
-
-        if self._active_params_display_frame is not None and self._active_params_display_frame.winfo_exists():
-            old_active_frame_id = id(self._active_params_display_frame)
-            logger.debug(f"update_strategy_params_ui: Zerstöre alten _active_params_display_frame (ID: {old_active_frame_id}, Name: {str(self._active_params_display_frame)}).")
-            try:
-                self._active_params_display_frame.destroy()
-                logger.debug(f"update_strategy_params_ui: Alter _active_params_display_frame (ID: {old_active_frame_id}) erfolgreich zerstört.")
-            except Exception as e:
-                 logger.error(f"update_strategy_params_ui: Fehler beim Zerstören des alten _active_params_display_frame (ID: {old_active_frame_id}): {e}", exc_info=True)
-        elif self._active_params_display_frame:
-            logger.warning(f"update_strategy_params_ui: Alter _active_params_display_frame (ID: {id(self._active_params_display_frame)}) existiert nicht mehr laut winfo_exists().")
-
-        self._active_params_display_frame = ctk.CTkFrame(self.strategy_params_container_frame)
-        self._active_params_display_frame.pack(fill="x", expand=True, padx=0, pady=0)
-        logger.debug(f"update_strategy_params_ui: Neuer _active_params_display_frame erstellt (ID: {id(self._active_params_display_frame)}, Name: {str(self._active_params_display_frame)}, Parent: {str(self.strategy_params_container_frame)}).")
-
-        self.current_strategy_param_vars = {}
-        logger.debug(f"update_strategy_params_ui: self.current_strategy_param_vars geleert.")
-
-        param_configs = []
-        if strategy_name == "MA_Crossover":
-            param_configs = [
-                ("Short Window:", "short_window", "20", 0, 0), ("Long Window:", "long_window", "50", 0, 2)
-            ]
-        elif strategy_name == "RSI":
-            param_configs = [
-                ("RSI Window:", "rsi_window", "14", 0, 0), ("Oversold:", "rsi_oversold", "30", 0, 2),
-                ("Overbought:", "rsi_overbought", "70", 0, 4)
-            ]
-
-        for label_text, key, default_value, r, c_label in param_configs:
-            ctk.CTkLabel(self._active_params_display_frame, text=label_text).grid(row=r, column=c_label, padx=5, pady=2, sticky="w")
-            var = ctk.StringVar(value=default_value)
-            entry = ctk.CTkEntry(self._active_params_display_frame, width=60, textvariable=var)
-            entry.grid(row=r, column=c_label + 1, padx=5, pady=2)
-            self.current_strategy_param_vars[key] = var
-            logger.debug(f"update_strategy_params_ui: Parameter '{key}' erstellt (StringVar ID: {id(var)}, Entry ID: {id(entry)}).")
-
-        # Allgemeine Parameter
-        common_params_row = 1 # Nächste Zeile für allgemeine Parameter
-        ctk.CTkLabel(self._active_params_display_frame, text="Shares/Trade:").grid(row=common_params_row, column=0, padx=5, pady=2, sticky="w")
-        spt_var = ctk.StringVar(value="10")
-        entry_spt = ctk.CTkEntry(self._active_params_display_frame, width=60, textvariable=spt_var)
-        entry_spt.grid(row=common_params_row, column=1, padx=5, pady=2)
-        self.current_strategy_param_vars['shares_per_trade'] = spt_var
-        logger.debug(f"update_strategy_params_ui: Parameter 'shares_per_trade' erstellt (StringVar ID: {id(spt_var)}, Entry ID: {id(entry_spt)}).")
-
-        ctk.CTkLabel(self._active_params_display_frame, text="Initial Capital:").grid(row=common_params_row, column=2, padx=5, pady=2, sticky="w")
-        ic_var = ctk.StringVar(value="10000")
-        entry_ic = ctk.CTkEntry(self._active_params_display_frame, width=80, textvariable=ic_var)
-        entry_ic.grid(row=common_params_row, column=3, padx=5, pady=2)
-        self.current_strategy_param_vars['initial_capital'] = ic_var
-        logger.debug(f"update_strategy_params_ui: Parameter 'initial_capital' erstellt (StringVar ID: {id(ic_var)}, Entry ID: {id(entry_ic)}).")
-        logger.info(f"update_strategy_params_ui: Beendet für strategy_name='{strategy_name}'.")
-
-
-    def run_backtest_and_display(self):
-        logger.info("run_backtest_and_display: Aufgerufen.")
-        try:
-            logger.debug("run_backtest_and_display: Versuche Fokus auf Hauptfenster zu setzen.")
-            self.focus_set()
-            logger.debug("run_backtest_and_display: Fokus auf Hauptfenster gesetzt.")
-        except Exception as e:
-            logger.warning(f"run_backtest_and_display: Fehler beim Setzen des Fokus: {e}", exc_info=True)
-
-        if self.data_frame is None or self.data_frame.empty:
-            logger.warning("run_backtest_and_display: data_frame ist leer oder None.")
-            messagebox.showerror("Fehler", "Keine Daten für Backtesting vorhanden. Bitte zuerst Daten abrufen.")
-            return
-
-        strategy_name = self.strategy_var.get() # StringVar ist sicher
-        logger.debug(f"run_backtest_and_display: Strategie: '{strategy_name}'. Parameter-Keys: {list(self.current_strategy_param_vars.keys())}")
-
-        params = {}
-        try:
-            for key, str_var in self.current_strategy_param_vars.items():
-                if not isinstance(str_var, ctk.StringVar): # Zusätzliche Sicherheitsprüfung
-                    logger.error(f"run_backtest_and_display: Eintrag für '{key}' in current_strategy_param_vars ist keine StringVar, sondern {type(str_var)}.")
-                    messagebox.showerror("Interner Fehler", f"Falscher Typ für Parameter '{key}'.")
-                    return # Frühzeitiger Ausstieg
-
-                logger.debug(f"run_backtest_and_display: Lese Parameter '{key}' (StringVar ID: {id(str_var)}).")
-                value_str = str_var.get()
-                logger.debug(f"run_backtest_and_display: Parameter '{key}' Rohwert von StringVar: '{value_str}'.")
-                if key in ['short_window', 'long_window', 'rsi_window', 'rsi_oversold', 'rsi_overbought', 'shares_per_trade']:
-                    params[key] = int(value_str)
-                elif key == 'initial_capital':
-                     params[key] = float(value_str)
+    def _add_tab(self, widget: QWidget, title: str, switch_to_tab: bool = True) -> int:
+        """
+        Fügt einen neuen Tab hinzu. Wenn ein Tab mit demselben Titel bereits existiert,
+        wird dieser aktualisiert (Widget ausgetauscht) oder einfach zu ihm gewechselt.
+        Gibt den Index des Tabs zurück.
+        """
+        for i in range(self.tab_widget.count()):
+            if self.tab_widget.tabText(i) == title:
+                logger.debug(f"MainWindow._add_tab: Tab '{title}' existiert bereits. Aktualisiere Inhalt oder wechsle.")
+                old_widget = self.tab_widget.widget(i)
+                if old_widget is not widget: # Nur austauschen, wenn es ein neues Widget ist
+                    self.tab_widget.removeTab(i)
+                    # old_widget.deleteLater() # Sicherstellen, dass altes Widget gelöscht wird
+                    index = self.tab_widget.insertTab(i, widget, title)
                 else:
-                    params[key] = value_str
-                logger.debug(f"run_backtest_and_display: Parameter '{key}' konvertierter Wert: {params[key]}.")
-        except ValueError as e:
-            logger.error(f"run_backtest_and_display: ValueError beim Konvertieren der Parameter: '{e}'. Key: '{key}', Wert: '{value_str}'.", exc_info=False)
-            messagebox.showerror("Parameterfehler", f"Bitte gültige Zahlen für Strategieparameter eingeben (Fehler bei '{key}').")
-            self.after(10, lambda: self._update_backtest_results_ui({"error": f"Ungültiger Parameter '{key}': {value_str}"}, None))
-            return
-        except Exception as e: # Fängt auch TclError ab, falls str_var.get() fehlschlägt
-            logger.error(f"run_backtest_and_display: Unerwarteter Fehler beim Abrufen/Konvertieren von Parameter '{key}': {e}", exc_info=True)
-            messagebox.showerror("Parameterfehler", f"Fehler beim Lesen des Parameters '{key}'.")
-            self.after(10, lambda: self._update_backtest_results_ui({"error": f"Fehler bei Parameter '{key}': {e}"}, None))
-            return
+                    index = i
 
-        logger.debug(f"run_backtest_and_display: Parameter für Strategie '{strategy_name}': {params}")
+                if switch_to_tab:
+                    self.tab_widget.setCurrentIndex(index)
+                return index
 
-        # Extrahiere Backtester-spezifische Parameter
-        initial_capital = params.pop('initial_capital', 10000.0)
-        shares_per_trade_val = params.pop('shares_per_trade', None)
+        index = self.tab_widget.addTab(widget, title)
+        if switch_to_tab:
+            self.tab_widget.setCurrentIndex(index)
+        logger.info(f"MainWindow._add_tab: Neuer Tab '{title}' an Index {index} hinzugefügt und ausgewählt.")
+        return index
 
-        # Temporär feste Werte für Kommission und Slippage
-        commission = 0.0
-        slippage = 0.0
+    def close_tab(self, index: int):
+        tab_text = self.tab_widget.tabText(index)
+        logger.info(f"MainWindow.close_tab: Schließe Tab mit Index {index} ('{tab_text}').")
 
-        fig = None # Initialisiere fig für den Fehlerfall
-        metrics = {"info": "Backtest gestartet..."} # Initiale Metriken
+        # Spezifische Aufräumarbeiten, falls nötig (z.B. Matplotlib Canvas)
+        if tab_text == "Backtest Ergebnisse":
+            if self.mpl_canvas and self.mpl_canvas.parent() is not None:
+                logger.debug("MainWindow.close_tab: Entferne Matplotlib Canvas aus Backtest-Ergebnis-Tab.")
+                self.mpl_canvas.setParent(None)
+                self.mpl_canvas.deleteLater()
+                self.mpl_canvas = None
+                self.mpl_figure = None # Auch Figur freigeben
 
-        try:
-            logger.info(f"run_backtest_and_display: Setup Strategie '{strategy_name}'.")
-            strategy_instance = setup_strategy(strategy_name, self.data_frame.copy(), params)
-            if not strategy_instance:
-                logger.error(f"run_backtest_and_display: Strategie '{strategy_name}' konnte nicht initialisiert werden.")
-                messagebox.showerror("Strategiefehler", f"Strategie {strategy_name} konnte nicht initialisiert werden.")
-                self.after(10, lambda: self._update_backtest_results_ui({"error": f"Strategie {strategy_name} nicht initialisiert"}, None))
+        widget_to_close = self.tab_widget.widget(index)
+        self.tab_widget.removeTab(index)
+        if widget_to_close:
+            widget_to_close.deleteLater()
+
+
+    def show_data_fetch_tab(self):
+        logger.info("MainWindow.show_data_fetch_tab: Erstelle/zeige Datenabruf-Tab.")
+
+        # Prüfe, ob Tab schon existiert
+        for i in range(self.tab_widget.count()):
+            if self.tab_widget.tabText(i) == "Datenabruf":
+                self.tab_widget.setCurrentIndex(i)
+                logger.debug("MainWindow.show_data_fetch_tab: Wechsle zu existierendem Tab 'Datenabruf'.")
                 return
 
-            logger.info(f"run_backtest_and_display: Initialisiere Backtester mit Kapital {initial_capital}.")
-            backtester = Backtester(strategy_instance,
-                                    initial_capital=initial_capital,
-                                    commission_per_trade=commission,
-                                    slippage_pct=slippage)
+        data_fetch_widget = QWidget()
+        main_v_layout = QVBoxLayout(data_fetch_widget)
 
-            logger.info(f"run_backtest_and_display: Starte Backtest-Lauf (Shares/Trade: {shares_per_trade_val}).")
-            if shares_per_trade_val and shares_per_trade_val > 0 :
-                 backtester.run_backtest(shares_per_trade=shares_per_trade_val)
+        # Eingabebereich
+        input_groupbox = QGroupBox("Dateneingabe")
+        form_layout = QFormLayout()
+
+        self.df_ticker_edit = QLineEdit("AAPL")
+        self.df_start_date_edit = QDateEdit(QDate.currentDate().addYears(-1))
+        self.df_start_date_edit.setCalendarPopup(True)
+        self.df_start_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.df_end_date_edit = QDateEdit(QDate.currentDate())
+        self.df_end_date_edit.setCalendarPopup(True)
+        self.df_end_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.df_interval_combo = QComboBox()
+        self.df_interval_combo.addItems(["1d", "1wk", "1mo", "1h", "30m", "5m"])
+
+        form_layout.addRow("Ticker:", self.df_ticker_edit)
+        form_layout.addRow("Startdatum:", self.df_start_date_edit)
+        form_layout.addRow("Enddatum:", self.df_end_date_edit)
+        form_layout.addRow("Intervall:", self.df_interval_combo)
+
+        fetch_button = QPushButton("Daten abrufen")
+        fetch_button.clicked.connect(self._fetch_data_action)
+        form_layout.addRow(fetch_button)
+        input_groupbox.setLayout(form_layout)
+        main_v_layout.addWidget(input_groupbox)
+
+        # Anzeigebereich (QTableView)
+        self.data_table_view = QTableView()
+        self.data_table_view.setSortingEnabled(True)
+        self.data_table_view.setAlternatingRowColors(True)
+        self.data_table_view.horizontalHeader().setStretchLastSection(True)
+        main_v_layout.addWidget(self.data_table_view)
+
+        self._add_tab(data_fetch_widget, "Datenabruf")
+
+    def _fetch_data_action(self):
+        ticker = self.df_ticker_edit.text()
+        start_date = self.df_start_date_edit.date().toString("yyyy-MM-dd")
+        end_date = self.df_end_date_edit.date().toString("yyyy-MM-dd")
+        interval = self.df_interval_combo.currentText()
+        logger.info(f"Datenabruf gestartet für Ticker: {ticker}, von: {start_date}, bis: {end_date}, Intervall: {interval}")
+        self.status_bar.showMessage(f"Rufe Daten für {ticker} ab...")
+
+        try:
+            # Datenabruf im Hintergrund wäre besser für größere Anfragen, hier direkt für Einfachheit
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.current_data_df = fetch_data(ticker, start_date, end_date, interval)
+            QApplication.restoreOverrideCursor()
+
+            if self.current_data_df is not None and not self.current_data_df.empty:
+                logger.info(f"{len(self.current_data_df)} Datenpunkte für {ticker} geladen.")
+                # Um den Index korrekt darzustellen, resetten wir ihn temporär als Spalte
+                display_df = self.current_data_df.reset_index()
+                model = DataFrameModel(display_df, self)
+                self.data_table_view.setModel(model)
+                self.data_table_view.resizeColumnsToContents()
+                self.status_bar.showMessage(f"Daten für {ticker} erfolgreich geladen.", 5000)
+
+                stock_info = get_stock_info(ticker) # Kann None zurückgeben
+                if stock_info and 'longName' in stock_info:
+                    self.app_title_label.setText(stock_info['longName'])
+                else:
+                    self.app_title_label.setText(ticker if ticker else "FinanceTool")
+
+            elif self.current_data_df is not None and self.current_data_df.empty:
+                logger.warning(f"Keine Daten für {ticker} im Zeitraum gefunden.")
+                QMessageBox.information(self, "Keine Daten", f"Keine Daten für {ticker} im angegebenen Zeitraum gefunden.")
+                self.data_table_view.setModel(None)
+                self.status_bar.showMessage(f"Keine Daten für {ticker} gefunden.", 5000)
             else:
-                 logger.debug("run_backtest_and_display: Verwende capital_per_trade_pct=0.1 als Fallback.")
-                 backtester.run_backtest(capital_per_trade_pct=0.1)
-            logger.info("run_backtest_and_display: Backtest-Lauf beendet. Berechne Metriken.")
+                raise Exception("fetch_data gab None oder unerwartetes Ergebnis zurück")
+        except Exception as e:
+            QApplication.restoreOverrideCursor() # Cursor zurücksetzen im Fehlerfall
+            logger.error(f"Fehler beim Abrufen oder Anzeigen der Daten für {ticker}: {e}", exc_info=True)
+            QMessageBox.critical(self, "Fehler", f"Fehler beim Abrufen der Daten für {ticker}:\n{e}")
+            self.data_table_view.setModel(None)
+            self.status_bar.showMessage(f"Fehler beim Datenabruf für {ticker}.", 5000)
 
-            metrics = backtester.calculate_performance_metrics()
-            logger.info(f"run_backtest_and_display: Metriken berechnet: {metrics}")
 
-            logger.debug("run_backtest_and_display: Erstelle Chart Figure.")
-            fig = Figure(figsize=(8, 4), dpi=100)
-            ax1 = fig.add_subplot(111)
+    def show_indicators_tab(self):
+        logger.info("MainWindow.show_indicators_tab: Erstelle/zeige Indikatoren-Tab.")
+
+        for i in range(self.tab_widget.count()):
+            if self.tab_widget.tabText(i) == "Indikatoren":
+                self.tab_widget.setCurrentIndex(i)
+                logger.debug("MainWindow.show_indicators_tab: Wechsle zu existierendem Tab 'Indikatoren'.")
+                return
+
+        indicators_widget = QWidget()
+        layout = QVBoxLayout(indicators_widget)
+
+        text_area = QTextEdit()
+        text_area.setReadOnly(True)
+
+        if not self.available_indicators_info:
+            self._load_available_indicators()
+
+        if self.available_indicators_info:
+            html_text = "<h1>Verfügbare Indikatoren</h1>"
+            for indi in self.available_indicators_info:
+                html_text += f"<h2>{indi['name']}</h2>"
+                html_text += f"<p><i>{indi['description']}</i></p>"
+                html_text += "<b>Parameter:</b><ul>"
+                for param in indi['parameters']:
+                    html_text += f"<li><b>{param['name']}</b> (Typ: {param['type']}, Default: {param['default']})<br>{param['description']}</li>"
+                html_text += "</ul><b>Ausgabefelder:</b> <code>" + ", ".join(indi['output_fields']) + "</code><hr>"
+            text_area.setHtml(html_text)
+        else:
+            text_area.setText("Keine Indikatoreninformationen verfügbar oder geladen.")
+
+        layout.addWidget(text_area)
+        self._add_tab(indicators_widget, "Indikatoren")
+
+
+    def show_strategy_mgmt_tab(self):
+        logger.info("MainWindow.show_strategy_mgmt_tab: Erstelle/zeige Strategie-Management-Tab.")
+
+        tab_title = "Strategie Mgmt."
+        # Vermeide Duplikate, wenn Button mehrmals geklickt wird
+        for i in range(self.tab_widget.count()):
+            if self.tab_widget.tabText(i) == tab_title:
+                self.tab_widget.setCurrentIndex(i)
+                logger.debug(f"MainWindow.show_strategy_mgmt_tab: Wechsle zu existierendem Tab '{tab_title}'.")
+                return
+
+        self.strategy_mgmt_widget = QWidget() # Eigene Referenz für späteren Zugriff auf Widgets darin
+        layout = QVBoxLayout(self.strategy_mgmt_widget)
+
+        # Bereich zum Laden von Strategien
+        load_group = QGroupBox("Strategie Laden/Anzeigen")
+        load_layout = QVBoxLayout()
+
+        load_button = QPushButton("Strategie aus JSON laden")
+        load_button.clicked.connect(self._load_strategy_action)
+        load_layout.addWidget(load_button)
+
+        self.strat_info_area = QTextEdit() # Attribut für Zugriff von _load_strategy_action
+        self.strat_info_area.setReadOnly(True)
+        self.strat_info_area.setText("Keine Strategie geladen. Bitte eine .json Datei auswählen.")
+        self.strat_info_area.setFixedHeight(150)
+        load_layout.addWidget(self.strat_info_area)
+        load_group.setLayout(load_layout)
+        layout.addWidget(load_group)
+
+        # Bereich für Backtesting-Start mit geladener Strategie
+        run_backtest_group = QGroupBox("Backtest mit geladener Strategie")
+        run_backtest_form_layout = QFormLayout()
+
+        # Eingabefelder für Backtest-Parameter (Ticker, Zeitraum etc.)
+        # Initialwerte von Datenabruf-Tab übernehmen, falls vorhanden
+        default_ticker = self.df_ticker_edit.text() if hasattr(self, 'df_ticker_edit') and self.df_ticker_edit.text() else "AAPL"
+        self.bt_ticker_edit = QLineEdit(default_ticker)
+
+        default_start_date = self.df_start_date_edit.date() if hasattr(self, 'df_start_date_edit') else QDate.currentDate().addYears(-2)
+        self.bt_start_date_edit = QDateEdit(default_start_date)
+        self.bt_start_date_edit.setCalendarPopup(True)
+        self.bt_start_date_edit.setDisplayFormat("yyyy-MM-dd")
+
+        default_end_date = self.df_end_date_edit.date() if hasattr(self, 'df_end_date_edit') else QDate.currentDate()
+        self.bt_end_date_edit = QDateEdit(default_end_date)
+        self.bt_end_date_edit.setCalendarPopup(True)
+        self.bt_end_date_edit.setDisplayFormat("yyyy-MM-dd")
+
+        self.bt_interval_combo = QComboBox()
+        self.bt_interval_combo.addItems(["1d", "1wk", "1mo", "1h", "30m", "5m"])
+        if hasattr(self, 'df_interval_combo'):
+            self.bt_interval_combo.setCurrentText(self.df_interval_combo.currentText())
+
+        self.bt_initial_capital_edit = QLineEdit("10000.0")
+        self.bt_commission_edit = QLineEdit("0.0")
+        self.bt_slippage_edit = QLineEdit("0.0") # In Prozent, z.B. 0.001 für 0.1%
+
+        run_backtest_form_layout.addRow("Ticker:", self.bt_ticker_edit)
+        run_backtest_form_layout.addRow("Startdatum:", self.bt_start_date_edit)
+        run_backtest_form_layout.addRow("Enddatum:", self.bt_end_date_edit)
+        run_backtest_form_layout.addRow("Intervall:", self.bt_interval_combo)
+        run_backtest_form_layout.addRow("Startkapital:", self.bt_initial_capital_edit)
+        run_backtest_form_layout.addRow("Kommission/Trade:", self.bt_commission_edit)
+        run_backtest_form_layout.addRow("Slippage (z.B. 0.001):", self.bt_slippage_edit)
+
+        self.run_backtest_from_strat_button = QPushButton("Backtest für geladene Strategie starten")
+        self.run_backtest_from_strat_button.clicked.connect(self._run_backtest_for_loaded_strategy)
+        self.run_backtest_from_strat_button.setEnabled(False) # Aktivieren, wenn Strategie UND Daten geladen
+        run_backtest_form_layout.addRow(self.run_backtest_from_strat_button)
+        run_backtest_group.setLayout(run_backtest_form_layout)
+        layout.addWidget(run_backtest_group)
+
+        layout.addStretch()
+        self._add_tab(self.strategy_mgmt_widget, tab_title)
+
+    def _load_strategy_action(self):
+        logger.debug("MainWindow._load_strategy_action: Öffne Datei-Dialog zum Laden der Strategie.")
+        filepath, _ = QFileDialog.getOpenFileName(self, "Strategie laden", "", "JSON Dateien (*.json);;Alle Dateien (*)")
+        if filepath:
+            try:
+                self.current_strategy_def = load_strategy_from_json(filepath)
+                if self.current_strategy_def:
+                    logger.info(f"Strategie '{self.current_strategy_def.name}' geladen von {filepath}")
+                    self.strat_info_area.setText(
+                        f"Strategie Geladen:\n\nName: {self.current_strategy_def.name}\n"
+                        f"Beschreibung: {self.current_strategy_def.description}\n"
+                        f"Version: {self.current_strategy_def.version}\n"
+                        f"Kaufregeln: {len(self.current_strategy_def.buy_rules)}\n"
+                        f"Verkaufsregeln: {len(self.current_strategy_def.sell_rules)}"
+                    )
+                    self.run_backtest_from_strat_button.setEnabled(True) # Button aktivieren
+                    self.status_bar.showMessage(f"Strategie '{self.current_strategy_def.name}' geladen.", 5000)
+                else:
+                    raise ValueError("load_strategy_from_json gab None zurück.") # Sollte nicht passieren, wenn None zurückgegeben wird
+            except Exception as e:
+                logger.error(f"Fehler beim Laden der Strategie von {filepath}: {e}", exc_info=True)
+                QMessageBox.critical(self, "Fehler", f"Konnte Strategie nicht laden:\n{e}")
+                self.current_strategy_def = None
+                self.strat_info_area.setText("Fehler beim Laden der Strategie.")
+                self.run_backtest_from_strat_button.setEnabled(False)
+                self.status_bar.showMessage("Fehler beim Laden der Strategie.", 5000)
+
+    def _run_backtest_for_loaded_strategy(self):
+        logger.info("MainWindow._run_backtest_for_loaded_strategy: Starte Backtest für geladene Strategie.")
+        if not self.current_strategy_def:
+            QMessageBox.warning(self, "Keine Strategie", "Bitte zuerst eine Strategie laden.")
+            return
+
+        # Hole Parameter aus den UI-Feldern des Strategie-Management-Tabs
+        ticker = self.bt_ticker_edit.text()
+        start_date = self.bt_start_date_edit.date().toString("yyyy-MM-dd")
+        end_date = self.bt_end_date_edit.date().toString("yyyy-MM-dd")
+        interval = self.bt_interval_combo.currentText()
+        try:
+            initial_capital = float(self.bt_initial_capital_edit.text())
+            commission = float(self.bt_commission_edit.text())
+            slippage = float(self.bt_slippage_edit.text())
+        except ValueError:
+            QMessageBox.critical(self, "Parameterfehler", "Startkapital, Kommission und Slippage müssen gültige Zahlen sein.")
+            return
+
+        if not ticker:
+            QMessageBox.warning(self, "Ticker fehlt", "Bitte einen Ticker für den Backtest angeben.")
+            return
+
+        logger.info(f"Starte Backtest mit: Ticker={ticker}, Start={start_date}, Ende={end_date}, Intervall={interval}, Strategie='{self.current_strategy_def.name}', Kapital={initial_capital}")
+        self.status_bar.showMessage(f"Starte Backtest für {self.current_strategy_def.name} auf {ticker}...")
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        try:
+            # Backtester-Instanz verwenden oder neu erstellen, falls Konfiguration pro Lauf nötig
+            # Hier verwenden wir die in __init__ erstellte Instanz und setzen Parameter neu, falls nötig
+            # Besser: Backtester nimmt Kapital etc. im Konstruktor an.
+            # Für dieses Beispiel: Wir erstellen eine neue Instanz oder konfigurieren die bestehende.
+            # Da der Backtester bereits initial_capital etc. im Konstruktor hat, erstellen wir ihn neu.
+            # Oder wir machen diese Parameter zu run_backtest Parametern.
+            # Ich passe den Backtester an, um Kapital etc. in run_backtest zu akzeptieren.
+            # Für jetzt: Annahme, dass der Backtester in __init__ bereits korrekt konfiguriert wurde
+            # oder wir erstellen ihn hier neu.
+
+            # Erstelle eine neue Backtester-Instanz mit den aktuellen GUI-Werten
+            current_backtester = Backtester(initial_capital=initial_capital, commission_per_trade=commission, slippage_pct=slippage)
+
+            current_backtester.run_backtest(
+                ticker=ticker,
+                start_date=start_date,
+                end_date=end_date,
+                interval=interval,
+                strategy_def=self.current_strategy_def,
+                data_pipeline_func=prepare_data_for_strategy,
+                strategy_engine_cls=StrategyEvaluator,
+                capital_per_trade_pct=0.25 # Beispiel, sollte konfigurierbar sein oder shares_per_trade
+            )
+            metrics = current_backtester.calculate_performance_metrics()
+
+            QApplication.restoreOverrideCursor()
+            self.show_backtesting_tab(metrics=metrics, backtester=current_backtester, ticker_for_plot=ticker) # Übergebe den verwendeten Backtester
+            self.status_bar.showMessage(f"Backtest für {self.current_strategy_def.name} abgeschlossen.", 5000)
+
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            logger.error(f"Fehler während des Backtests für Strategie '{self.current_strategy_def.name}': {e}", exc_info=True)
+            QMessageBox.critical(self, "Backtest Fehler", f"Fehler im Backtest-Prozess:\n{e}")
+            self.status_bar.showMessage(f"Fehler im Backtest.", 5000)
+            # Zeige leeren Backtest-Tab oder Fehlerinfo im Tab
+            self.show_backtesting_tab(metrics={"error": str(e)}, backtester=None, ticker_for_plot=ticker)
+
+
+    def show_backtesting_tab(self, metrics: Optional[Dict[str, Any]] = None,
+                             backtester: Optional[Backtester] = None,
+                             ticker_for_plot: Optional[str] = None):
+        logger.info("MainWindow.show_backtesting_tab: Erstelle/zeige Backtest-Ergebnisse-Tab.")
+
+        tab_title = "Backtest Ergebnisse"
+        existing_tab_index = -1
+        for i in range(self.tab_widget.count()):
+            if self.tab_widget.tabText(i) == tab_title:
+                existing_tab_index = i
+                # Alten Inhalt entfernen, bevor neuer hinzugefügt wird
+                old_widget = self.tab_widget.widget(i)
+                if old_widget:
+                    old_widget.deleteLater()
+                self.tab_widget.removeTab(i)
+                break # Breche Schleife, da Tab neu erstellt wird
+
+        # Erstelle das Widget für den Tab-Inhalt immer neu für sauberen Zustand
+        self.backtest_results_widget = QWidget()
+        layout = QVBoxLayout(self.backtest_results_widget)
+
+        # Metriken-Anzeige
+        metrics_group = QGroupBox("Performance Metriken")
+        metrics_layout = QVBoxLayout()
+        metrics_text_area = QTextEdit()
+        metrics_text_area.setReadOnly(True)
+
+        strat_name_display = "N/A"
+        if backtester and backtester.strategy_def: # backtester könnte None sein im Fehlerfall
+            strat_name_display = backtester.strategy_def.name
+        elif self.current_strategy_def: # Fallback auf die zuletzt global geladene Strategie
+             strat_name_display = self.current_strategy_def.name
+
+
+        if metrics:
+            metrics_str = f"Backtest Ergebnisse für '{strat_name_display}' auf {ticker_for_plot or 'N/A'}:\n\n"
+            if "error" in metrics:
+                 metrics_str += f"  Fehler: {metrics['error']}\n"
+                 if "details" in metrics:
+                     metrics_str += f"  Details: {metrics['details']}\n"
+            else:
+                for key, value in metrics.items():
+                    metrics_str += f"  {key.replace('_', ' ').capitalize()}: {value}\n"
+            metrics_text_area.setText(metrics_str)
+        else:
+            metrics_text_area.setText("Noch keine Backtest-Ergebnisse vorhanden oder Fehler beim Laden.\nStarten Sie einen Backtest über 'Strategie Mgmt'.")
+
+        metrics_layout.addWidget(metrics_text_area)
+        metrics_group.setLayout(metrics_layout)
+        layout.addWidget(metrics_group, 1)
+
+        # Chart-Anzeige
+        chart_group = QGroupBox("Portfolio Entwicklung & Trades")
+        chart_layout_container = QVBoxLayout() # Layout für den GroupBox
+
+        # Wichtig: Matplotlib Canvas braucht einen Parent beim Erstellen
+        # Wir erstellen einen inneren Widget-Container für den Canvas
+        chart_render_widget = QWidget()
+        chart_render_layout = QVBoxLayout(chart_render_widget) # Layout für den Canvas selbst
+
+        if backtester and backtester.portfolio_history is not None and not backtester.portfolio_history.empty and \
+           backtester.data_with_indicators is not None and not backtester.data_with_indicators.empty:
+
+            if self.mpl_canvas and self.mpl_canvas.parent() is not None:
+                 self.mpl_canvas.setParent(None)
+                 self.mpl_canvas.deleteLater()
+
+            self.mpl_figure = Figure(figsize=(10, 6), dpi=100) # Angepasste Größe
+            ax1 = self.mpl_figure.add_subplot(111)
             ax1.plot(backtester.portfolio_history.index, backtester.portfolio_history['total_value'], label='Portfolio Value', color='blue', lw=1.5)
-            ax1.set_xlabel('Datum', fontsize=10)
-            ax1.set_ylabel('Portfolio Wert (€)', color='blue', fontsize=10)
+            ax1.set_xlabel('Datum'); ax1.set_ylabel('Portfolio Wert (€)', color='blue')
             ax1.tick_params(axis='y', labelcolor='blue', labelsize=8)
-            ax1.tick_params(axis='x', labelsize=8, rotation=20)
-            ax1.set_title(f'Portfolio Entwicklung ({strategy_name})', fontsize=12)
+            ax1.tick_params(axis='x', labelsize=8, rotation=15) # Weniger Rotation für Lesbarkeit
+            title_str = f'Portfolio: {strat_name_display}'
+            if ticker_for_plot: title_str += f' auf {ticker_for_plot}'
+            ax1.set_title(title_str, fontsize=10)
             ax1.grid(True, linestyle='--', alpha=0.6)
 
             ax2 = ax1.twinx()
-            ax2.plot(backtester.data.index, backtester.data['Close'], label=f'{self.ticker_entry.get() if hasattr(self,"ticker_entry") and self.ticker_entry.winfo_exists() else "N/A"} Close', color='grey', alpha=0.5, lw=1)
-            ax2.set_ylabel('Aktienkurs (€)', color='grey', fontsize=10)
+            ax2.plot(backtester.data_with_indicators.index, backtester.data_with_indicators['close'], label=f'{ticker_for_plot or "Asset"} Preis', color='grey', alpha=0.5, lw=1)
+            ax2.set_ylabel('Preis (€)', color='grey')
             ax2.tick_params(axis='y', labelcolor='grey', labelsize=8)
 
-            if backtester.results is not None and not backtester.results.empty:
-                buys = backtester.results[backtester.results['type'] == 'Buy']
-                sells = backtester.results[backtester.results['type'] == 'Sell']
-                if not buys.empty:
-                    ax2.plot(buys['timestamp'], buys['price'], '^', markersize=5, color='green', lw=0, label='Kauf')
-                if not sells.empty:
-                    ax2.plot(sells['timestamp'], sells['price'], 'v', markersize=5, color='red', lw=0, label='Verkauf')
+            if backtester.trades_log is not None and not backtester.trades_log.empty:
+                buys = backtester.trades_log[backtester.trades_log['type'] == 'Buy']
+                sells = backtester.trades_log[backtester.trades_log['type'] == 'Sell']
+                if not buys.empty: ax2.plot(buys['timestamp'], buys['price'], '^', markersize=6, color='green', alpha=0.8, lw=0, label='Kauf')
+                if not sells.empty: ax2.plot(sells['timestamp'], sells['price'], 'v', markersize=6, color='red', alpha=0.8, lw=0, label='Verkauf')
 
             lines, labels = ax1.get_legend_handles_labels()
             lines2, labels2 = ax2.get_legend_handles_labels()
-            ax1.legend(lines + lines2, labels + labels2, loc='upper left', fontsize=8)
-            fig.tight_layout()
-            logger.debug("run_backtest_and_display: Chart Figure erstellt.")
+            ax1.legend(lines + lines2, labels + labels2, loc='upper left', fontsize='small')
+            self.mpl_figure.tight_layout()
 
-            logger.info("run_backtest_and_display: Plane verzögertes UI-Update für Ergebnisse.")
-            self.after(10, lambda: self._update_backtest_results_ui(metrics, fig))
-
-        except ValueError as e: # Dieser Block fängt spezifische ValueErrors aus dem Backtesting-Prozess
-            logger.error(f"run_backtest_and_display: ValueError im Backtesting-Prozess: {e}", exc_info=True)
-            messagebox.showerror("Parameterfehler", f"Fehler in den Parametern oder Daten: {e}")
-            self.after(10, lambda: self._update_backtest_results_ui({"error": str(e)}, fig)) # fig könnte None sein
-        except Exception as e: # Fängt alle anderen Fehler im Backtesting-Prozess, einschließlich potenzieller TclErrors
-            logger.critical(f"run_backtest_and_display: Unerwarteter Fehler im Backtest-Prozess: {e}", exc_info=True)
-            messagebox.showerror("Backtest Fehler", f"Ein unerwarteter Fehler ist aufgetreten: {e}")
-            import traceback
-            error_info = traceback.format_exc()
-            self.after(10, lambda: self._update_backtest_results_ui({"error": str(e), "details": error_info.splitlines()[-1] if error_info else "N/A"}, fig)) # fig könnte None sein
-        logger.info("run_backtest_and_display: Beendet.")
-
-
-    def _update_backtest_results_ui(self, metrics, fig):
-        logger.info("_update_backtest_results_ui: Aufgerufen.")
-        logger.debug(f"_update_backtest_results_ui: Übergebene Metriken: {metrics}, Figure vorhanden: {fig is not None}")
-
-        # Sicherstellen, dass die UI-Elemente existieren, bevor darauf zugegriffen wird
-        if not (hasattr(self, 'metrics_text') and self.metrics_text and self.metrics_text.winfo_exists()):
-            logger.error("_update_backtest_results_ui: metrics_text Widget existiert nicht oder wurde zerstört.")
-            return
-
-        self.metrics_text.configure(state="normal")
-        self.metrics_text.delete("0.0", "end")
-
-        try:
-            ticker_display_name = self.ticker_entry.get() if hasattr(self,"ticker_entry") and self.ticker_entry and self.ticker_entry.winfo_exists() else "N/A"
-        except Exception as e:
-            logger.warning(f"_update_backtest_results_ui: Fehler beim Abrufen von ticker_entry: {e}")
-            ticker_display_name = "N/A"
-
-        try:
-            strategy_display_name = self.strategy_var.get() if hasattr(self,"strategy_var") else "N/A"
-        except Exception as e:
-            logger.warning(f"_update_backtest_results_ui: Fehler beim Abrufen von strategy_var: {e}")
-            strategy_display_name = "N/A"
-
-
-        metrics_str = f"Backtest für {strategy_display_name} auf {ticker_display_name}:\n"
-        if "error" in metrics:
-            metrics_str += f"  Fehler: {metrics['error']}\n"
-            if "details" in metrics:
-                 metrics_str += f"  Details: {metrics['details']}\n"
+            self.mpl_canvas = FigureCanvasQTAgg(self.mpl_figure)
+            chart_render_layout.addWidget(self.mpl_canvas) # Canvas zum inneren Layout hinzufügen
         else:
-            for key, value in metrics.items():
-                metrics_str += f"  {key.replace('_', ' ').capitalize()}: {value}\n"
-        self.metrics_text.insert("0.0", metrics_str)
-        self.metrics_text.configure(state="disabled")
-        logger.debug(f"_update_backtest_results_ui: metrics_text aktualisiert.")
+            no_chart_label = QLabel("Chart-Daten nicht verfügbar oder Backtest fehlgeschlagen.")
+            no_chart_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            chart_render_layout.addWidget(no_chart_label) # Label zum inneren Layout
+
+        chart_group.setLayout(chart_render_layout) # Inneres Layout dem GroupBox zuweisen
+        layout.addWidget(chart_group, 3)
+
+        # Tab hinzufügen oder aktualisieren
+        # Da wir den alten Tab (falls vorhanden) oben entfernt haben, fügen wir ihn immer neu hinzu.
+        self._add_tab(self.backtest_results_widget, tab_title, switch_to_tab=True)
 
 
-        if not (hasattr(self, 'chart_frame') and self.chart_frame and self.chart_frame.winfo_exists()):
-            logger.error("_update_backtest_results_ui: chart_frame Widget existiert nicht oder wurde zerstört.")
-            return
-
-        for widget in self.chart_frame.winfo_children():
-            logger.debug(f"_update_backtest_results_ui: Zerstöre altes Kind-Widget im chart_frame (ID: {id(widget)}, Name: {str(widget)})")
-            widget.destroy()
-
-        if fig:
-            logger.debug(f"_update_backtest_results_ui: Zeichne neuen Chart (Figure ID: {id(fig)}) im chart_frame (ID: {id(self.chart_frame)}).")
-            try:
-                canvas = FigureCanvasTkAgg(fig, master=self.chart_frame)
-                canvas_widget = canvas.get_tk_widget()
-                canvas_widget.pack(side=ctk.TOP, fill=ctk.BOTH, expand=True)
-                canvas.draw()
-                logger.debug(f"_update_backtest_results_ui: Chart erfolgreich gezeichnet und gepackt.")
-            except Exception as e:
-                logger.error(f"_update_backtest_results_ui: Fehler beim Erstellen/Zeichnen des Canvas: {e}", exc_info=True)
-                ctk.CTkLabel(self.chart_frame, text="Fehler beim Anzeigen des Charts.").pack(padx=10, pady=10)
-        else:
-            logger.info("_update_backtest_results_ui: Keine Figure zum Zeichnen vorhanden (z.B. Fehlerfall). Zeige Info-Label.")
-            ctk.CTkLabel(self.chart_frame, text="Chart konnte nicht geladen werden oder Fehler beim Backtest.").pack(padx=10, pady=10)
-        logger.info("_update_backtest_results_ui: Beendet.")
+    def closeEvent(self, event):
+        logger.info("MainWindow.closeEvent: Anwendung wird geschlossen.")
+        # Hier könnten Speicher- oder Aufräumaktionen vor dem Schließen stattfinden
+        super().closeEvent(event)
 
 
 if __name__ == '__main__':
-    # Wichtiger Hinweis: Damit die relativen Importe funktionieren, wenn gui.py direkt ausgeführt wird,
-    # muss das Hauptverzeichnis (finance_analysis_tool) im PYTHONPATH sein oder
-    # man startet es als Modul vom Hauptverzeichnis: python -m finance_tool.gui
-
-    # Für Testzwecke kann man sys.path anpassen, aber das ist kein guter Stil für die Distribution:
-    # import sys
-    # import os
-    # sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
-    # Minimal logging setup for direct run of gui.py for testing
-    if not logging.getLogger().hasHandlers(): # Configure only if not already configured by main.py
+    # Grundlegendes Logging für den direkten Testlauf von gui.py
+    if not logging.getLogger().hasHandlers():
         logging.basicConfig(level=logging.DEBUG,
                             format='%(asctime)s - %(levelname)s - %(module)s:%(lineno)d - %(message)s',
                             handlers=[logging.StreamHandler(sys.stdout)])
 
-    app = FinanceApp()
-    app.mainloop()
+    app = QApplication(sys.argv)
+    main_window = MainWindow()
+    main_window.show()
+    logger.info("Starte PyQt6 Event Loop...")
+    sys.exit(app.exec())
