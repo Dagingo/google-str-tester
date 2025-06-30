@@ -232,6 +232,10 @@ class FinanceApp(ctk.CTk):
         backtest_controls_frame.grid_columnconfigure(1, weight=1)
         self.update_strategy_params_ui("MA_Crossover") # Initiale Parameter anzeigen
 
+        # Initialisiere das Dictionary für Strategieparameter-Variablen
+        self.current_strategy_param_vars = {}
+
+
         # --- Bereich für Backtesting-Chart und Metriken ---
         self.backtest_display_frame = ctk.CTkFrame(self.current_main_frame)
         self.backtest_display_frame.grid(row=1, column=0, padx=10, pady=10, sticky="nsew")
@@ -253,53 +257,52 @@ class FinanceApp(ctk.CTk):
         for widget in self.strategy_params_frame.winfo_children():
             widget.destroy()
 
-        self.current_strategy_param_entries = {}
+        self.current_strategy_param_vars = {} # Wird jetzt verwendet, um StringVars zu speichern
 
         if strategy_name == "MA_Crossover":
             ctk.CTkLabel(self.strategy_params_frame, text="Short Window:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
-            entry_sw = ctk.CTkEntry(self.strategy_params_frame, width=60)
+            sw_var = ctk.StringVar(value="20")
+            entry_sw = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=sw_var)
             entry_sw.grid(row=0, column=1, padx=5, pady=2)
-            entry_sw.insert(0, "20")
-            self.current_strategy_param_entries['short_window'] = entry_sw
+            self.current_strategy_param_vars['short_window'] = sw_var
 
             ctk.CTkLabel(self.strategy_params_frame, text="Long Window:").grid(row=0, column=2, padx=5, pady=2, sticky="w")
-            entry_lw = ctk.CTkEntry(self.strategy_params_frame, width=60)
+            lw_var = ctk.StringVar(value="50")
+            entry_lw = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=lw_var)
             entry_lw.grid(row=0, column=3, padx=5, pady=2)
-            entry_lw.insert(0, "50")
-            self.current_strategy_param_entries['long_window'] = entry_lw
+            self.current_strategy_param_vars['long_window'] = lw_var
 
         elif strategy_name == "RSI":
             ctk.CTkLabel(self.strategy_params_frame, text="RSI Window:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
-            entry_rw = ctk.CTkEntry(self.strategy_params_frame, width=60)
+            rw_var = ctk.StringVar(value="14")
+            entry_rw = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=rw_var)
             entry_rw.grid(row=0, column=1, padx=5, pady=2)
-            entry_rw.insert(0, "14")
-            self.current_strategy_param_entries['rsi_window'] = entry_rw
+            self.current_strategy_param_vars['rsi_window'] = rw_var
 
             ctk.CTkLabel(self.strategy_params_frame, text="Oversold:").grid(row=0, column=2, padx=5, pady=2, sticky="w")
-            entry_os = ctk.CTkEntry(self.strategy_params_frame, width=60)
+            os_var = ctk.StringVar(value="30")
+            entry_os = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=os_var)
             entry_os.grid(row=0, column=3, padx=5, pady=2)
-            entry_os.insert(0, "30")
-            self.current_strategy_param_entries['rsi_oversold'] = entry_os
+            self.current_strategy_param_vars['rsi_oversold'] = os_var
 
             ctk.CTkLabel(self.strategy_params_frame, text="Overbought:").grid(row=0, column=4, padx=5, pady=2, sticky="w")
-            entry_ob = ctk.CTkEntry(self.strategy_params_frame, width=60)
+            ob_var = ctk.StringVar(value="70")
+            entry_ob = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=ob_var)
             entry_ob.grid(row=0, column=5, padx=5, pady=2)
-            entry_ob.insert(0, "70")
-            self.current_strategy_param_entries['rsi_overbought'] = entry_ob
+            self.current_strategy_param_vars['rsi_overbought'] = ob_var
 
-        # TODO: Parameter für Shares per Trade / Capital per Trade Pct hinzufügen
+        # Allgemeine Parameter (Shares/Trade, Initial Capital)
         ctk.CTkLabel(self.strategy_params_frame, text="Shares/Trade:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
-        entry_spt = ctk.CTkEntry(self.strategy_params_frame, width=60)
+        spt_var = ctk.StringVar(value="10")
+        entry_spt = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=spt_var)
         entry_spt.grid(row=1, column=1, padx=5, pady=2)
-        entry_spt.insert(0, "10") # Default, oder leer lassen für capital_pct
-        self.current_strategy_param_entries['shares_per_trade'] = entry_spt
+        self.current_strategy_param_vars['shares_per_trade'] = spt_var
 
-        # Initial Capital, Commission, Slippage (könnten auch globaler sein)
         ctk.CTkLabel(self.strategy_params_frame, text="Initial Capital:").grid(row=1, column=2, padx=5, pady=2, sticky="w")
-        entry_ic = ctk.CTkEntry(self.strategy_params_frame, width=80)
+        ic_var = ctk.StringVar(value="10000")
+        entry_ic = ctk.CTkEntry(self.strategy_params_frame, width=80, textvariable=ic_var)
         entry_ic.grid(row=1, column=3, padx=5, pady=2)
-        entry_ic.insert(0, "10000")
-        self.current_strategy_param_entries['initial_capital'] = entry_ic
+        self.current_strategy_param_vars['initial_capital'] = ic_var
 
 
     def run_backtest_and_display(self):
@@ -310,14 +313,14 @@ class FinanceApp(ctk.CTk):
         strategy_name = self.strategy_var.get()
         params = {}
         try:
-            for key, entry_widget in self.current_strategy_param_entries.items():
-                # Spezifische Konvertierung für Fensterparameter (int) und Kapital (float)
+            for key, str_var in self.current_strategy_param_vars.items():
+                value_str = str_var.get()
                 if key in ['short_window', 'long_window', 'rsi_window', 'rsi_oversold', 'rsi_overbought', 'shares_per_trade']:
-                    params[key] = int(entry_widget.get())
+                    params[key] = int(value_str)
                 elif key == 'initial_capital':
-                     params[key] = float(entry_widget.get())
-                else: # Für zukünftige Parameter als String belassen oder spezifisch behandeln
-                    params[key] = entry_widget.get()
+                     params[key] = float(value_str)
+                else:
+                    params[key] = value_str
         except ValueError:
             messagebox.showerror("Parameterfehler", "Bitte gültige Zahlen für Strategieparameter eingeben.")
             return
