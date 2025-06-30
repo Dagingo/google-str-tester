@@ -222,18 +222,20 @@ class FinanceApp(ctk.CTk):
         self.strategy_menu = ctk.CTkOptionMenu(backtest_controls_frame, variable=self.strategy_var, values=self.strategy_options, command=self.update_strategy_params_ui)
         self.strategy_menu.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
-        # Frame für Strategieparameter
-        self.strategy_params_frame = ctk.CTkFrame(backtest_controls_frame)
-        self.strategy_params_frame.grid(row=1, column=0, columnspan=4, padx=5, pady=5, sticky="ew")
+        # Container-Frame für Strategieparameter (bleibt statisch, Inhalt wird dynamisch)
+        self.strategy_params_container_frame = ctk.CTkFrame(backtest_controls_frame)
+        self.strategy_params_container_frame.grid(row=1, column=0, columnspan=4, padx=5, pady=5, sticky="ew")
+        self._active_params_display_frame = None # Wird in update_strategy_params_ui verwaltet
 
         self.run_backtest_button = ctk.CTkButton(backtest_controls_frame, text="Backtest starten", command=self.run_backtest_and_display)
         self.run_backtest_button.grid(row=0, column=2, padx=10, pady=5)
 
         backtest_controls_frame.grid_columnconfigure(1, weight=1)
-        self.update_strategy_params_ui("MA_Crossover") # Initiale Parameter anzeigen
 
-        # Initialisiere das Dictionary für Strategieparameter-Variablen
+        # Initialisiere das Dictionary für Strategieparameter-Variablen schon hier,
+        # da update_strategy_params_ui es erwartet.
         self.current_strategy_param_vars = {}
+        self.update_strategy_params_ui("MA_Crossover") # Initiale Parameter anzeigen
 
 
         # --- Bereich für Backtesting-Chart und Metriken ---
@@ -253,59 +255,65 @@ class FinanceApp(ctk.CTk):
 
 
     def update_strategy_params_ui(self, strategy_name):
-        # Alte Parameter-Widgets entfernen
-        for widget in self.strategy_params_frame.winfo_children():
-            widget.destroy()
+        # Zerstöre den alten Frame, der die Parameter-Widgets enthält, falls er existiert
+        if self._active_params_display_frame is not None and self._active_params_display_frame.winfo_exists():
+            self._active_params_display_frame.destroy()
+
+        # Erstelle einen neuen Frame für die Parameter-Widgets innerhalb des statischen Containers
+        self._active_params_display_frame = ctk.CTkFrame(self.strategy_params_container_frame)
+        self._active_params_display_frame.pack(fill="x", expand=True, padx=0, pady=0) # padx/pady hier auf 0, da der Container schon Padding hat
 
         self.current_strategy_param_vars = {} # Wird jetzt verwendet, um StringVars zu speichern
 
         if strategy_name == "MA_Crossover":
-            ctk.CTkLabel(self.strategy_params_frame, text="Short Window:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
+            ctk.CTkLabel(self._active_params_display_frame, text="Short Window:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
             sw_var = ctk.StringVar(value="20")
-            entry_sw = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=sw_var)
+            entry_sw = ctk.CTkEntry(self._active_params_display_frame, width=60, textvariable=sw_var)
             entry_sw.grid(row=0, column=1, padx=5, pady=2)
             self.current_strategy_param_vars['short_window'] = sw_var
 
-            ctk.CTkLabel(self.strategy_params_frame, text="Long Window:").grid(row=0, column=2, padx=5, pady=2, sticky="w")
+            ctk.CTkLabel(self._active_params_display_frame, text="Long Window:").grid(row=0, column=2, padx=5, pady=2, sticky="w")
             lw_var = ctk.StringVar(value="50")
-            entry_lw = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=lw_var)
+            entry_lw = ctk.CTkEntry(self._active_params_display_frame, width=60, textvariable=lw_var)
             entry_lw.grid(row=0, column=3, padx=5, pady=2)
             self.current_strategy_param_vars['long_window'] = lw_var
 
         elif strategy_name == "RSI":
-            ctk.CTkLabel(self.strategy_params_frame, text="RSI Window:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
+            ctk.CTkLabel(self._active_params_display_frame, text="RSI Window:").grid(row=0, column=0, padx=5, pady=2, sticky="w")
             rw_var = ctk.StringVar(value="14")
-            entry_rw = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=rw_var)
+            entry_rw = ctk.CTkEntry(self._active_params_display_frame, width=60, textvariable=rw_var)
             entry_rw.grid(row=0, column=1, padx=5, pady=2)
             self.current_strategy_param_vars['rsi_window'] = rw_var
 
-            ctk.CTkLabel(self.strategy_params_frame, text="Oversold:").grid(row=0, column=2, padx=5, pady=2, sticky="w")
+            ctk.CTkLabel(self._active_params_display_frame, text="Oversold:").grid(row=0, column=2, padx=5, pady=2, sticky="w")
             os_var = ctk.StringVar(value="30")
-            entry_os = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=os_var)
+            entry_os = ctk.CTkEntry(self._active_params_display_frame, width=60, textvariable=os_var)
             entry_os.grid(row=0, column=3, padx=5, pady=2)
             self.current_strategy_param_vars['rsi_oversold'] = os_var
 
-            ctk.CTkLabel(self.strategy_params_frame, text="Overbought:").grid(row=0, column=4, padx=5, pady=2, sticky="w")
+            ctk.CTkLabel(self._active_params_display_frame, text="Overbought:").grid(row=0, column=4, padx=5, pady=2, sticky="w")
             ob_var = ctk.StringVar(value="70")
-            entry_ob = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=ob_var)
+            entry_ob = ctk.CTkEntry(self._active_params_display_frame, width=60, textvariable=ob_var)
             entry_ob.grid(row=0, column=5, padx=5, pady=2)
             self.current_strategy_param_vars['rsi_overbought'] = ob_var
 
         # Allgemeine Parameter (Shares/Trade, Initial Capital)
-        ctk.CTkLabel(self.strategy_params_frame, text="Shares/Trade:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
+        ctk.CTkLabel(self._active_params_display_frame, text="Shares/Trade:").grid(row=1, column=0, padx=5, pady=2, sticky="w")
         spt_var = ctk.StringVar(value="10")
-        entry_spt = ctk.CTkEntry(self.strategy_params_frame, width=60, textvariable=spt_var)
+        entry_spt = ctk.CTkEntry(self._active_params_display_frame, width=60, textvariable=spt_var)
         entry_spt.grid(row=1, column=1, padx=5, pady=2)
         self.current_strategy_param_vars['shares_per_trade'] = spt_var
 
-        ctk.CTkLabel(self.strategy_params_frame, text="Initial Capital:").grid(row=1, column=2, padx=5, pady=2, sticky="w")
+        ctk.CTkLabel(self._active_params_display_frame, text="Initial Capital:").grid(row=1, column=2, padx=5, pady=2, sticky="w")
         ic_var = ctk.StringVar(value="10000")
-        entry_ic = ctk.CTkEntry(self.strategy_params_frame, width=80, textvariable=ic_var)
+        entry_ic = ctk.CTkEntry(self._active_params_display_frame, width=80, textvariable=ic_var)
         entry_ic.grid(row=1, column=3, padx=5, pady=2)
         self.current_strategy_param_vars['initial_capital'] = ic_var
 
 
     def run_backtest_and_display(self):
+        self.focus_set() # Setze Fokus auf das Hauptfenster
+
         if self.data_frame is None or self.data_frame.empty:
             messagebox.showerror("Fehler", "Keine Daten für Backtesting vorhanden. Bitte zuerst Daten abrufen.")
             return
